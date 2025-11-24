@@ -1,1 +1,8 @@
 streamlit
+torch
+torchvision
+torchaudio
+opencv-python-headless
+numpy
+ffmpeg-python
+moviepy
