@@ -2,7 +2,8 @@ streamlit
 torch
 torchvision
 torchaudio
+mmengine
+mmdet
+mmyolo
 opencv-python-headless
 numpy
-ffmpeg-python
-moviepy

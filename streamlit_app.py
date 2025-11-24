@@ -1,133 +1,190 @@
 import streamlit as st
-import torch
-import tempfile
 import os
+import tempfile
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------
-# 1. Initialisation de l'état
-# ---------------------------------------------------------
-if "model_paths" not in st.session_state:
-    st.session_state["model_paths"] = {}   # {nom_fichier: chemin_local}
+from mmdet.apis import init_detector, inference_detector
+
+
+# ===============================
+# 1. State Streamlit
+# ===============================
+if "configs" not in st.session_state:
+    st.session_state["configs"] = {}          # {name: path}
+if "checkpoints" not in st.session_state:
+    st.session_state["checkpoints"] = {}      # {name: path}
 if "current_model" not in st.session_state:
     st.session_state["current_model"] = None
 if "current_model_name" not in st.session_state:
     st.session_state["current_model_name"] = None
 
 
-# ---------------------------------------------------------
-# 2. Fonctions modèle (TorchScript)
-# ---------------------------------------------------------
+# ===============================
+# 2. Fonctions utilitaires
+# ===============================
 
-def load_torchscript_model(model_path, device="cpu"):
-    """
-    Charge un modèle TorchScript (.pth) directement
-    sans avoir besoin d'une classe Python.
-    """
-    model = torch.jit.load(model_path, map_location=device)
-    model.to(device)
-    model.eval()
+def save_uploaded_files(uploaded_files, target_dir):
+    """Sauvegarde des fichiers Streamlit dans un dossier temporaire."""
+    os.makedirs(target_dir, exist_ok=True)
+    saved_paths = {}
+    for f in uploaded_files:
+        save_path = os.path.join(target_dir, f.name)
+        if not os.path.exists(save_path):
+            with open(save_path, "wb") as out:
+                out.write(f.getbuffer())
+        saved_paths[f.name] = save_path
+    return saved_paths
+
+
+def load_mmdet_model(config_path, checkpoint_path, device="cpu"):
+    """Initialise un modèle MMDetection/MMYOLO."""
+    model = init_detector(config_path, checkpoint_path, device=device)
     return model
 
 
-def run_inference_on_frame(model, frame, device="cpu"):
+def draw_detections(frame, result, model, score_thr=0.3):
     """
-    Applique le modèle sur UN frame et renvoie le frame annoté.
-
-    ⚠️ Version générique :
-       - convertit en RGB
-       - resize en 224x224
-       - normalise en [0,1]
-       - appelle le modèle
-       - écrit juste "Inference OK" (à personnaliser selon les outputs)
+    Dessine les bounding boxes à partir du résultat de inference_detector.
+    Compatible MMDetection 3.x (DetDataSample).
     """
+    # result est souvent un DetDataSample
+    if hasattr(result, "pred_instances"):
+        preds = result.pred_instances
 
-    # BGR -> RGB
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if hasattr(preds, "scores"):
+            scores = preds.scores.detach().cpu().numpy()
+            bboxes = preds.bboxes.detach().cpu().numpy()
+            labels = preds.labels.detach().cpu().numpy()
+        else:
+            return frame
+    else:
+        # fallback : format ancien (liste de ndarrays par classe)
+        # on ne gère pas trop ce cas ici, mais tu peux l'adapter si besoin
+        return frame
 
-    # resize vers 224x224 (à adapter si besoin)
-    img_resized = cv2.resize(rgb, (224, 224))
+    # noms de classes
+    class_names = None
+    if hasattr(model, "dataset_meta"):
+        class_names = model.dataset_meta.get("classes", None)
 
-    # HWC -> CHW -> batch
-    tensor = torch.from_numpy(img_resized).float().permute(2, 0, 1).unsqueeze(0)  # (1,3,224,224)
-    tensor = tensor.to(device) / 255.0
+    img = frame.copy()
 
-    with torch.no_grad():
-        outputs = model(tensor)
+    for bbox, score, label in zip(bboxes, scores, labels):
+        if score < score_thr:
+            continue
 
-    # Ici tu peux interpréter outputs (classification, détection, etc.)
-    # Pour l'instant, on fait juste une overlay texte
-    annotated = frame.copy()
-    cv2.putText(
-        annotated,
-        "Inference OK",
-        (20, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
-    return annotated
+        x1, y1, x2, y2 = bbox.astype(int)
+
+        # rectangle
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        # texte label
+        if class_names is not None:
+            cls_name = class_names[int(label)]
+        else:
+            cls_name = f"class_{int(label)}"
+
+        text = f"{cls_name} {score:.2f}"
+        cv2.putText(
+            img,
+            text,
+            (x1, max(y1 - 5, 0)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return img
 
 
-# ---------------------------------------------------------
-# 3. Sidebar : upload & sélection de modèles
-# ---------------------------------------------------------
-st.sidebar.title("🧠 Modèles (.pth)")
+# ===============================
+# 3. Sidebar : gestion des modèles
+# ===============================
 
-uploaded_models = st.sidebar.file_uploader(
-    "Uploader un ou plusieurs modèles TorchScript (.pth)",
-    type=["pth", "pt"],
+st.sidebar.title("🧠 Gestion des modèles MMYOLO / MMDetection")
+
+# Upload de config(s)
+uploaded_configs = st.sidebar.file_uploader(
+    "Uploader les fichiers de config (.py, .yaml, .yml)",
+    type=["py", "yaml", "yml"],
     accept_multiple_files=True,
 )
 
-models_dir = os.path.join(tempfile.gettempdir(), "streamlit_models")
-os.makedirs(models_dir, exist_ok=True)
+# Upload de checkpoint(s) (.pth)
+uploaded_checkpoints = st.sidebar.file_uploader(
+    "Uploader les checkpoints (.pth)",
+    type=["pth"],
+    accept_multiple_files=True,
+)
 
-# Sauvegarder les modèles uploadés dans un répertoire temporaire
-if uploaded_models:
-    for f in uploaded_models:
-        if f.name not in st.session_state["model_paths"]:
-            save_path = os.path.join(models_dir, f.name)
-            with open(save_path, "wb") as out:
-                out.write(f.getbuffer())
-            st.session_state["model_paths"][f.name] = save_path
-            st.sidebar.success(f"Modèle ajouté : {f.name}")
+# Dossiers temporaires
+configs_dir = os.path.join(tempfile.gettempdir(), "streamlit_configs")
+ckpts_dir = os.path.join(tempfile.gettempdir(), "streamlit_ckpts")
 
-if len(st.session_state["model_paths"]) == 0:
-    st.sidebar.info("Aucun modèle uploadé pour l'instant.")
-    selected_model_name = None
-else:
-    selected_model_name = st.sidebar.selectbox(
-        "Sélectionner un modèle",
-        options=list(st.session_state["model_paths"].keys()),
+# Sauvegarder les fichiers uploadés
+if uploaded_configs:
+    new_cfgs = save_uploaded_files(uploaded_configs, configs_dir)
+    st.session_state["configs"].update(new_cfgs)
+    for name in new_cfgs.keys():
+        st.sidebar.success(f"Config ajoutée : {name}")
+
+if uploaded_checkpoints:
+    new_ckpts = save_uploaded_files(uploaded_checkpoints, ckpts_dir)
+    st.session_state["checkpoints"].update(new_ckpts)
+    for name in new_ckpts.keys():
+        st.sidebar.success(f"Checkpoint ajouté : {name}")
+
+if len(st.session_state["configs"]) == 0:
+    st.sidebar.info("Aucune config disponible.")
+if len(st.session_state["checkpoints"]) == 0:
+    st.sidebar.info("Aucun checkpoint disponible.")
+
+# Sélection config + checkpoint
+selected_cfg = None
+selected_ckpt = None
+
+if len(st.session_state["configs"]) > 0:
+    selected_cfg = st.sidebar.selectbox(
+        "Sélectionner une config",
+        options=list(st.session_state["configs"].keys()),
         index=0,
     )
 
-# Device (tu peux ajouter "cuda" si tu es sur une machine avec GPU)
-device = st.sidebar.selectbox("Device", ["cpu"], index=0)
+if len(st.session_state["checkpoints"]) > 0:
+    selected_ckpt = st.sidebar.selectbox(
+        "Sélectionner un checkpoint",
+        options=list(st.session_state["checkpoints"].keys()),
+        index=0,
+    )
 
-# Bouton pour charger le modèle sélectionné
-if selected_model_name is not None:
+device = st.sidebar.selectbox("Device", ["cpu"], index=0)  # Ajoute "cuda:0" si dispo
+score_thr = st.sidebar.slider("Score threshold", 0.0, 1.0, 0.3, 0.05)
+
+# Bouton pour charger le modèle
+if selected_cfg and selected_ckpt:
     if st.sidebar.button("Charger ce modèle"):
-        path = st.session_state["model_paths"][selected_model_name]
+        cfg_path = st.session_state["configs"][selected_cfg]
+        ckpt_path = st.session_state["checkpoints"][selected_ckpt]
         try:
-            st.session_state["current_model"] = load_torchscript_model(path, device=device)
-            st.session_state["current_model_name"] = selected_model_name
-            st.sidebar.success(f"Modèle courant : {selected_model_name}")
+            model = load_mmdet_model(cfg_path, ckpt_path, device=device)
+            st.session_state["current_model"] = model
+            st.session_state["current_model_name"] = f"{selected_cfg} + {selected_ckpt}"
+            st.sidebar.success(f"Modèle chargé : {st.session_state['current_model_name']}")
         except Exception as e:
-            st.sidebar.error(f"Erreur au chargement du modèle : {e}")
+            st.sidebar.error(f"Erreur lors du chargement du modèle : {e}")
 
 
-# ---------------------------------------------------------
-# 4. Zone principale : vidéo + inference
-# ---------------------------------------------------------
-st.title("🎥 Tester un modèle TorchScript sur une vidéo")
+# ===============================
+# 4. Zone principale : vidéo
+# ===============================
+
+st.title("🎥 Tester un modèle MMYOLO / MMDetection sur une vidéo")
 
 if st.session_state["current_model"] is None:
-    st.warning("Aucun modèle chargé. Merci d'en sélectionner un dans la barre latérale.")
+    st.warning("Aucun modèle chargé pour l'instant. Choisis une config + checkpoint dans la barre latérale.")
 else:
     st.success(f"Modèle courant : {st.session_state['current_model_name']}")
 
@@ -139,7 +196,6 @@ video_file = st.file_uploader(
 video_path = None
 
 if video_file is not None:
-    # sauvegarde temporaire de la vidéo
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_file.read())
         video_path = tmp.name
@@ -147,7 +203,7 @@ if video_file is not None:
     st.subheader("Vidéo originale")
     st.video(video_path)
 
-# Lancer l'inférence sur la vidéo
+# Lancer l'inférence si modèle + vidéo OK
 if video_path is not None and st.session_state["current_model"] is not None:
     if st.button("Lancer l'inférence sur la vidéo"):
         st.info("Traitement de la vidéo en cours...")
@@ -161,7 +217,6 @@ if video_path is not None and st.session_state["current_model"] is not None:
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            # fichier vidéo de sortie
             out_fd, out_path = tempfile.mkstemp(suffix=".mp4")
             os.close(out_fd)
 
@@ -169,25 +224,23 @@ if video_path is not None and st.session_state["current_model"] is not None:
             writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
 
             progress = st.progress(0)
-            current_model = st.session_state["current_model"]
+            model = st.session_state["current_model"]
 
-            frame_idx = 0
+            idx = 0
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                annotated_frame = run_inference_on_frame(
-                    current_model,
-                    frame,
-                    device=device
-                )
+                # inference (frame en BGR)
+                result = inference_detector(model, frame)
+                annotated = draw_detections(frame, result, model, score_thr=score_thr)
 
-                writer.write(annotated_frame)
+                writer.write(annotated)
 
-                frame_idx += 1
+                idx += 1
                 if frame_count > 0:
-                    progress.progress(min(frame_idx / frame_count, 1.0))
+                    progress.progress(min(idx / frame_count, 1.0))
 
             cap.release()
             writer.release()
