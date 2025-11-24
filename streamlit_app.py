@@ -2,9 +2,8 @@ import streamlit as st
 import os
 import tempfile
 import cv2
-import numpy as np
 
-from mmdet.apis import init_detector, inference_detector
+from mmdet.apis import DetInferencer
 
 
 # ===============================
@@ -14,8 +13,8 @@ if "configs" not in st.session_state:
     st.session_state["configs"] = {}          # {name: path}
 if "checkpoints" not in st.session_state:
     st.session_state["checkpoints"] = {}      # {name: path}
-if "current_model" not in st.session_state:
-    st.session_state["current_model"] = None
+if "inferencer" not in st.session_state:
+    st.session_state["inferencer"] = None
 if "current_model_name" not in st.session_state:
     st.session_state["current_model_name"] = None
 
@@ -25,11 +24,12 @@ if "current_model_name" not in st.session_state:
 # ===============================
 
 def save_uploaded_files(uploaded_files, target_dir):
-    """Sauvegarde des fichiers Streamlit dans un dossier temporaire."""
+    """Sauvegarde des fichiers uploadés dans un dossier temporaire."""
     os.makedirs(target_dir, exist_ok=True)
     saved_paths = {}
     for f in uploaded_files:
         save_path = os.path.join(target_dir, f.name)
+        # on évite d'écraser inutilement
         if not os.path.exists(save_path):
             with open(save_path, "wb") as out:
                 out.write(f.getbuffer())
@@ -37,94 +37,54 @@ def save_uploaded_files(uploaded_files, target_dir):
     return saved_paths
 
 
-def load_mmdet_model(config_path, checkpoint_path, device="cpu"):
-    """Initialise un modèle MMDetection/MMYOLO."""
-    model = init_detector(config_path, checkpoint_path, device=device)
-    return model
-
-
-def draw_detections(frame, result, model, score_thr=0.3):
+def create_inferencer(config_path, checkpoint_path, device="cpu", score_thr=0.3):
     """
-    Dessine les bounding boxes à partir du résultat de inference_detector.
-    Compatible MMDetection 3.x (DetDataSample).
+    Crée un DetInferencer MMDetection avec ta config + checkpoint.
+    score_thr est passé comme argument par défaut pour filtrer les prédictions.
     """
-    # result est souvent un DetDataSample
-    if hasattr(result, "pred_instances"):
-        preds = result.pred_instances
+    inferencer = DetInferencer(
+        model=config_path,
+        weights=checkpoint_path,
+        device=device,
+        pred_score_thr=score_thr,
+    )
+    return inferencer
 
-        if hasattr(preds, "scores"):
-            scores = preds.scores.detach().cpu().numpy()
-            bboxes = preds.bboxes.detach().cpu().numpy()
-            labels = preds.labels.detach().cpu().numpy()
-        else:
-            return frame
-    else:
-        # fallback : format ancien (liste de ndarrays par classe)
-        # on ne gère pas trop ce cas ici, mais tu peux l'adapter si besoin
-        return frame
 
-    # noms de classes
-    class_names = None
-    if hasattr(model, "dataset_meta"):
-        class_names = model.dataset_meta.get("classes", None)
-
-    img = frame.copy()
-
-    for bbox, score, label in zip(bboxes, scores, labels):
-        if score < score_thr:
-            continue
-
-        x1, y1, x2, y2 = bbox.astype(int)
-
-        # rectangle
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        # texte label
-        if class_names is not None:
-            cls_name = class_names[int(label)]
-        else:
-            cls_name = f"class_{int(label)}"
-
-        text = f"{cls_name} {score:.2f}"
-        cv2.putText(
-            img,
-            text,
-            (x1, max(y1 - 5, 0)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return img
+def run_inference_on_frame(inferencer, frame):
+    """
+    Applique l'inférence sur un frame avec DetInferencer et récupère
+    directement l'image visualisée (bbox déjà dessinées).
+    """
+    # DetInferencer accepte un ndarray (H, W, 3) BGR directement
+    result = inferencer(frame, return_vis=True)
+    # result["visualization"] est une liste d'images
+    vis_frame = result["visualization"][0]  # np.ndarray (H, W, 3)
+    return vis_frame
 
 
 # ===============================
 # 3. Sidebar : gestion des modèles
 # ===============================
 
-st.sidebar.title("🧠 Gestion des modèles MMYOLO / MMDetection")
+st.sidebar.title("🧠 Modèles MMYOLO / MMDetection")
 
-# Upload de config(s)
 uploaded_configs = st.sidebar.file_uploader(
     "Uploader les fichiers de config (.py, .yaml, .yml)",
     type=["py", "yaml", "yml"],
     accept_multiple_files=True,
 )
 
-# Upload de checkpoint(s) (.pth)
 uploaded_checkpoints = st.sidebar.file_uploader(
     "Uploader les checkpoints (.pth)",
     type=["pth"],
     accept_multiple_files=True,
 )
 
-# Dossiers temporaires
 configs_dir = os.path.join(tempfile.gettempdir(), "streamlit_configs")
 ckpts_dir = os.path.join(tempfile.gettempdir(), "streamlit_ckpts")
 
-# Sauvegarder les fichiers uploadés
+# Sauvegarde des fichiers uploadés
 if uploaded_configs:
     new_cfgs = save_uploaded_files(uploaded_configs, configs_dir)
     st.session_state["configs"].update(new_cfgs)
@@ -142,7 +102,6 @@ if len(st.session_state["configs"]) == 0:
 if len(st.session_state["checkpoints"]) == 0:
     st.sidebar.info("Aucun checkpoint disponible.")
 
-# Sélection config + checkpoint
 selected_cfg = None
 selected_ckpt = None
 
@@ -160,17 +119,22 @@ if len(st.session_state["checkpoints"]) > 0:
         index=0,
     )
 
-device = st.sidebar.selectbox("Device", ["cpu"], index=0)  # Ajoute "cuda:0" si dispo
+device = st.sidebar.selectbox("Device", ["cpu"], index=0)   # ajoute "cuda:0" si tu as un GPU
 score_thr = st.sidebar.slider("Score threshold", 0.0, 1.0, 0.3, 0.05)
 
-# Bouton pour charger le modèle
+# Bouton pour charger / (re)créer l'inferencer
 if selected_cfg and selected_ckpt:
     if st.sidebar.button("Charger ce modèle"):
         cfg_path = st.session_state["configs"][selected_cfg]
         ckpt_path = st.session_state["checkpoints"][selected_ckpt]
         try:
-            model = load_mmdet_model(cfg_path, ckpt_path, device=device)
-            st.session_state["current_model"] = model
+            inferencer = create_inferencer(
+                cfg_path,
+                ckpt_path,
+                device=device,
+                score_thr=score_thr,
+            )
+            st.session_state["inferencer"] = inferencer
             st.session_state["current_model_name"] = f"{selected_cfg} + {selected_ckpt}"
             st.sidebar.success(f"Modèle chargé : {st.session_state['current_model_name']}")
         except Exception as e:
@@ -183,7 +147,7 @@ if selected_cfg and selected_ckpt:
 
 st.title("🎥 Tester un modèle MMYOLO / MMDetection sur une vidéo")
 
-if st.session_state["current_model"] is None:
+if st.session_state["inferencer"] is None:
     st.warning("Aucun modèle chargé pour l'instant. Choisis une config + checkpoint dans la barre latérale.")
 else:
     st.success(f"Modèle courant : {st.session_state['current_model_name']}")
@@ -203,8 +167,8 @@ if video_file is not None:
     st.subheader("Vidéo originale")
     st.video(video_path)
 
-# Lancer l'inférence si modèle + vidéo OK
-if video_path is not None and st.session_state["current_model"] is not None:
+# Lancer l'inférence sur la vidéo
+if video_path is not None and st.session_state["inferencer"] is not None:
     if st.button("Lancer l'inférence sur la vidéo"):
         st.info("Traitement de la vidéo en cours...")
 
@@ -224,7 +188,7 @@ if video_path is not None and st.session_state["current_model"] is not None:
             writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
 
             progress = st.progress(0)
-            model = st.session_state["current_model"]
+            inferencer = st.session_state["inferencer"]
 
             idx = 0
             while True:
@@ -232,11 +196,11 @@ if video_path is not None and st.session_state["current_model"] is not None:
                 if not ret:
                     break
 
-                # inference (frame en BGR)
-                result = inference_detector(model, frame)
-                annotated = draw_detections(frame, result, model, score_thr=score_thr)
+                # Inférence + visualisation bbox via MMDet
+                vis_frame = run_inference_on_frame(inferencer, frame)
 
-                writer.write(annotated)
+                # Assure-toi que vis_frame est en BGR avant d'écrire
+                writer.write(vis_frame)
 
                 idx += 1
                 if frame_count > 0:

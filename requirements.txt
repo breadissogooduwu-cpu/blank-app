@@ -1,9 +1,11 @@
-streamlit
 torch
 torchvision
 torchaudio
+
 mmengine
 mmdet
 mmyolo
+
+streamlit
 opencv-python-headless
 numpy
